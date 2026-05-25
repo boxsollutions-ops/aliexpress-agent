@@ -35,44 +35,15 @@ export const settingsRouter = createRouter({
       return { key: input.key, value };
     }),
 
-  update: publicQuery
+  set: publicQuery
     .input(
       z.object({
-        key: z.string(),
+        key: z.string().min(1),
         value: z.string(),
       })
     )
     .mutation(async ({ input }) => {
       await upsertSetting(input.key, input.value);
-      return { success: true };
-    }),
-
-  upsert: publicQuery
-    .input(
-      z.object({
-        key: z.string(),
-        value: z.string(),
-        description: z.string().optional(),
-      })
-    )
-    .mutation(async ({ input }) => {
-      await upsertSetting(input.key, input.value, input.description);
-      return { success: true };
-    }),
-
-  updateBulk: publicQuery
-    .input(
-      z.array(
-        z.object({
-          key: z.string(),
-          value: z.string(),
-        })
-      )
-    )
-    .mutation(async ({ input }) => {
-      for (const item of input) {
-        await upsertSetting(item.key, item.value);
-      }
       return { success: true };
     }),
 
