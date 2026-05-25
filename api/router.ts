@@ -7,9 +7,7 @@ import { templateRouter } from "./templateRouter";
 import { initializeDefaultSettings } from "./queries/settings";
 import { createRouter, publicQuery } from "./middleware";
 
-initializeDefaultSettings().catch((err) => {
-  console.warn("Settings init warning:", err.message);
-});
+initializeDefaultSettings().catch(() => {});
 
 export const appRouter = createRouter({
   ping: publicQuery.query(() => ({ ok: true, ts: Date.now() })),

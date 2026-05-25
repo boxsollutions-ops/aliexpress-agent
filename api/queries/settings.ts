@@ -3,159 +3,113 @@ import { settings } from "@db/schema";
 import { eq } from "drizzle-orm";
 import type { Setting, InsertSetting } from "@db/schema";
 
-const DEFAULT_SETTINGS: InsertSetting[] = [
-  {
-    key: "referralBaseUrl",
-    value: "",
-    description: "Base referral URL for AliExpress (e.g., https://s.click.aliexpress.com/e/______)",
-  },
-  {
-    key: "amazonReferralUrl",
-    value: "",
-    description: "Amazon Associates referral URL/tag (e.g., https://www.amazon.com?tag=yourtag-20)",
-  },
-  {
-    key: "pinterestAccessToken",
-    value: "",
-    description: "Pinterest API Access Token",
-    isEncrypted: true,
-  },
-  {
-    key: "pinterestBoardId",
-    value: "",
-    description: "Pinterest Board ID to post to",
-  },
-  {
-    key: "linkedinAccessToken",
-    value: "",
-    description: "LinkedIn API Access Token",
-    isEncrypted: true,
-  },
-  {
-    key: "linkedinUserId",
-    value: "",
-    description: "LinkedIn User URN (e.g., urn:li:person:xxx)",
-  },
-  {
-    key: "telegramBotToken",
-    value: "",
-    description: "Telegram Bot Token",
-    isEncrypted: true,
-  },
-  {
-    key: "telegramChannelId",
-    value: "",
-    description: "Telegram Channel ID (e.g., @mychannel or -100xxxx)",
-  },
-  {
-    key: "agentEnabled",
-    value: "false",
-    description: "Whether the auto-posting agent is enabled",
-  },
-  {
-    key: "agentIntervalMinutes",
-    value: "15",
-    description: "Interval between posts in minutes",
-  },
-  {
-    key: "maxPostsPerDay",
-    value: "96",
-    description: "Maximum number of posts per day (96 = every 15 min)",
-  },
-  {
-    key: "targetPlatforms",
-    value: JSON.stringify(["pinterest", "linkedin", "telegram"]),
-    description: "Platforms to post to (JSON array)",
-  },
-  {
-    key: "productSources",
-    value: JSON.stringify(["aliexpress", "amazon"]),
-    description: "Product sources to search (JSON array: aliexpress, amazon)",
-  },
-  {
-    key: "productCategories",
-    value: JSON.stringify(["electronics", "home", "fashion", "beauty", "toys"]),
-    description: "AliExpress product categories to search for (JSON array)",
-  },
-  {
-    key: "amazonProductCategories",
-    value: JSON.stringify(["electronics", "home-kitchen", "fashion", "beauty", "sports-outdoors"]),
-    description: "Amazon product categories to search for (JSON array)",
-  },
-  {
-    key: "minProductRating",
-    value: "4.0",
-    description: "Minimum product rating to include",
-  },
-  {
-    key: "minOrdersCount",
-    value: "100",
-    description: "Minimum number of orders for a product",
-  },
-  {
-    key: "postTemplate",
-    value: "🔥 {title}\n\n💰 Price: ${price}\n⭐ Rating: {rating}/5\n🛒 Orders: {orders}\n\n👇 Get it now:\n{referralUrl}",
-    description: "Default post template for Telegram",
-  },
+// In-memory store (works even if DB fails)
+const memoryStore: Map<string, string> = new Map();
+let initDone = false;
+
+const DEFAULTS: InsertSetting[] = [
+  { key: "referralBaseUrl", value: "https://s.click.aliexpress.com/e/_oCz4l5B" },
+  { key: "amazonReferralUrl", value: "boxsolutions-20" },
+  { key: "pinterestAccessToken", value: "" },
+  { key: "pinterestBoardId", value: "trending-products" },
+  { key: "linkedinAccessToken", value: "" },
+  { key: "linkedinUserId", value: "" },
+  { key: "telegramBotToken", value: "" },
+  { key: "telegramChannelId", value: "" },
+  { key: "agentEnabled", value: "false" },
+  { key: "agentIntervalMinutes", value: "15" },
+  { key: "maxPostsPerDay", value: "96" },
+  { key: "targetPlatforms", value: '["pinterest","linkedin","telegram"]' },
+  { key: "productSources", value: '["aliexpress","amazon"]' },
+  { key: "productCategories", value: '["electronics","home","fashion","beauty","toys"]' },
+  { key: "amazonProductCategories", value: '["electronics","home-kitchen","fashion","beauty","sports-outdoors"]' },
+  { key: "minProductRating", value: "4.0" },
+  { key: "minOrdersCount", value: "100" },
+  { key: "postTemplate", value: "{title}\n\nPrice: ${price}\nRating: {rating}/5\nOrders: {orders}\n\n{referralUrl}" },
 ];
 
 export async function initializeDefaultSettings(): Promise<void> {
-  const db = getDb();
-  for (const setting of DEFAULT_SETTINGS) {
-    await db
-      .insert(settings)
-      .values(setting)
-      .onDuplicateKeyUpdate({
-        set: { updatedAt: new Date() },
-      });
+  if (initDone) return;
+  initDone = true;
+  for (const s of DEFAULTS) memoryStore.set(s.key, s.value ?? "");
+  try {
+    const db = getDb();
+    for (const s of DEFAULTS) {
+      await db.insert(settings).values(s).onDuplicateKeyUpdate({ set: { updatedAt: new Date() } });
+    }
+  } catch (e: any) {
+    console.warn("DB init failed, using memory:", e.message);
   }
-}
-
-export async function findAllSettings(): Promise<Setting[]> {
-  return getDb().query.settings.findMany();
-}
-
-export async function findSettingByKey(key: string): Promise<Setting | undefined> {
-  return getDb().query.settings.findFirst({
-    where: eq(settings.key, key),
-  });
 }
 
 export async function getSettingValue(key: string): Promise<string | null> {
-  const setting = await findSettingByKey(key);
-  return setting?.value ?? null;
-}
-
-export async function getSettingJson<T = unknown>(key: string): Promise<T | null> {
-  const value = await getSettingValue(key);
-  if (!value) return null;
+  const mem = memoryStore.get(key);
+  if (mem !== undefined) return mem;
   try {
-    return JSON.parse(value) as T;
-  } catch {
-    return null;
+    const db = getDb();
+    const row = await db.query.settings.findFirst({ where: eq(settings.key, key) });
+    if (row?.value != null) { memoryStore.set(key, row.value); return row.value; }
+  } catch {}
+  return memoryStore.get(key) ?? null;
+}
+
+export async function setSettingValue(key: string, value: string): Promise<void> {
+  memoryStore.set(key, value);
+  try {
+    const db = getDb();
+    const existing = await db.query.settings.findFirst({ where: eq(settings.key, key) });
+    if (existing) {
+      await db.update(settings).set({ value, updatedAt: new Date() }).where(eq(settings.key, key));
+    } else {
+      await db.insert(settings).values({ key, value });
+    }
+  } catch (e: any) {
+    console.warn(`DB save failed for ${key}:`, e.message);
   }
 }
 
-export async function updateSetting(key: string, value: string): Promise<void> {
-  await getDb()
-    .update(settings)
-    .set({ value, updatedAt: new Date() })
-    .where(eq(settings.key, key));
+export async function getSettingJson<T>(key: string): Promise<T | null> {
+  const v = await getSettingValue(key);
+  if (!v) return null;
+  try { return JSON.parse(v) as T; } catch { return null; }
 }
 
-export async function upsertSetting(
-  key: string,
-  value: string,
-  description?: string
-): Promise<void> {
-  const db = getDb();
-  const existing = await findSettingByKey(key);
-  if (existing) {
-    await db
-      .update(settings)
-      .set({ value, updatedAt: new Date() })
-      .where(eq(settings.key, key));
-  } else {
-    await db.insert(settings).values({ key, value, description });
-  }
+export async function findAllSettings(): Promise<Setting[]> {
+  await initializeDefaultSettings();
+  try {
+    const db = getDb();
+    const rows = await db.select().from(settings);
+    for (const r of rows) memoryStore.set(r.key, r.value ?? "");
+  } catch {}
+  return DEFAULTS.map((s, i) => ({
+    id: i, key: s.key, value: memoryStore.get(s.key) ?? s.value ?? "",
+    description: s.description ?? null, isEncrypted: false, updatedAt: new Date(),
+  } as Setting));
+}
+
+export async function findSettingByKey(key: string): Promise<Setting | undefined> {
+  const all = await findAllSettings();
+  return all.find(s => s.key === key);
+}
+
+export async function upsertSetting(key: string, value: string, _desc?: string): Promise<void> {
+  await setSettingValue(key, value);
+}
+
+export async function getConnectionStatus() {
+  const pt = await getSettingValue("pinterestAccessToken");
+  const pb = await getSettingValue("pinterestBoardId");
+  const lt = await getSettingValue("linkedinAccessToken");
+  const lu = await getSettingValue("linkedinUserId");
+  const tt = await getSettingValue("telegramBotToken");
+  const tc = await getSettingValue("telegramChannelId");
+  const ref = await getSettingValue("referralBaseUrl");
+  const aref = await getSettingValue("amazonReferralUrl");
+  return {
+    pinterest: { connected: !!(pt && pb), hasToken: !!pt, hasBoard: !!pb },
+    linkedin: { connected: !!(lt && lu), hasToken: !!lt, hasUser: !!lu },
+    telegram: { connected: !!(tt && tc), hasToken: !!tt, hasChannel: !!tc },
+    referral: { configured: !!ref, url: ref },
+    amazonReferral: { configured: !!aref, url: aref },
+  };
 }
