@@ -12,14 +12,15 @@ import { startScheduler } from "./services/agent";
 
 const app = new Hono<{ Bindings: HttpBindings }>();
 
-let settingsInitialized = false;
+let initStarted = false;
 
 app.use(bodyLimit({ maxSize: 50 * 1024 * 1024 }));
 
-// Lazy initialize settings on first request
+// Non-blocking lazy init on first request
 app.use("/api/*", async (c, next) => {
-  if (!settingsInitialized) {
-    settingsInitialized = true;
+  if (!initStarted) {
+    initStarted = true;
+    // Fire-and-forget: don't block the request
     initializeDefaultSettings().catch((err) => {
       console.warn("[Boot] Settings init warning:", err.message);
     });
