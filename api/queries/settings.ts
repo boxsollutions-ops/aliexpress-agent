@@ -3,36 +3,37 @@ import { settings } from "@db/schema";
 import { eq } from "drizzle-orm";
 import type { Setting, InsertSetting } from "@db/schema";
 
-// In-memory store (works even if DB fails)
+// ─── In-memory fallback (works even if DB fails) ──────────────────
 const memoryStore: Map<string, string> = new Map();
 let initDone = false;
 
-const DEFAULTS: InsertSetting[] = [
-  { key: "referralBaseUrl", value: "https://s.click.aliexpress.com/e/_oCz4l5B" },
-  { key: "amazonReferralUrl", value: "boxsolutions-20" },
-  { key: "pinterestAccessToken", value: "" },
-  { key: "pinterestBoardId", value: "trending-products" },
-  { key: "linkedinAccessToken", value: "" },
-  { key: "linkedinUserId", value: "" },
-  { key: "telegramBotToken", value: "" },
-  { key: "telegramChannelId", value: "" },
-  { key: "agentEnabled", value: "false" },
-  { key: "agentIntervalMinutes", value: "15" },
-  { key: "maxPostsPerDay", value: "96" },
-  { key: "targetPlatforms", value: '["pinterest","linkedin","telegram"]' },
-  { key: "productSources", value: '["aliexpress","amazon"]' },
-  { key: "productCategories", value: '["electronics","home","fashion","beauty","toys"]' },
-  { key: "amazonProductCategories", value: '["electronics","home-kitchen","fashion","beauty","sports-outdoors"]' },
-  { key: "minProductRating", value: "4.0" },
-  { key: "minOrdersCount", value: "100" },
-  { key: "postTemplate", value: "{title}\n\nPrice: ${price}\nRating: {rating}/5\nOrders: {orders}\n\n{referralUrl}" },
+const DEFAULT_SETTINGS: InsertSetting[] = [
+  { key: "referralBaseUrl", value: "https://s.click.aliexpress.com/e/_oCz4l5B", description: "AliExpress referral" },
+  { key: "amazonReferralUrl", value: "boxsolutions-20", description: "Amazon Associates tag" },
+  { key: "pinterestAccessToken", value: "", description: "Pinterest API token" },
+  { key: "pinterestBoardId", value: "trending-products", description: "Pinterest board" },
+  { key: "linkedinAccessToken", value: "", description: "LinkedIn API token" },
+  { key: "linkedinUserId", value: "", description: "LinkedIn URN" },
+  { key: "telegramBotToken", value: "", description: "Telegram bot token" },
+  { key: "telegramChannelId", value: "", description: "Telegram channel" },
+  { key: "agentEnabled", value: "false", description: "Agent enabled" },
+  { key: "agentIntervalMinutes", value: "15", description: "Post interval" },
+  { key: "maxPostsPerDay", value: "96", description: "Max posts/day" },
+  { key: "targetPlatforms", value: JSON.stringify(["pinterest", "linkedin", "telegram"]), description: "Platforms" },
+  { key: "productSources", value: JSON.stringify(["aliexpress", "amazon"]), description: "Sources" },
+  { key: "productCategories", value: JSON.stringify(["electronics", "home", "fashion", "beauty", "toys"]), description: "AliExpress categories" },
+  { key: "amazonProductCategories", value: JSON.stringify(["electronics", "home-kitchen", "fashion", "beauty", "sports-outdoors"]), description: "Amazon categories" },
+  { key: "minProductRating", value: "4.0", description: "Min rating" },
+  { key: "minOrdersCount", value: "100", description: "Min orders" },
+  { key: "postTemplate", value: "🔥 {title}\n\n💰 Price: ${price}\n⭐ Rating: {rating}/5\n🛒 Orders: {orders}\n\n👇 Get it now:\n{referralUrl}", description: "Telegram template" },
 ];
 
+// ─── Initialize ──────────────────────────────────────────────────
 export async function initializeDefaultSettings(): Promise<void> {
   if (initDone) return;
   initDone = true;
 
-  // Step 1: Load existing values from DB FIRST (so they take priority over defaults)
+  // Step 1: Load existing values from DB FIRST (so they take priority)
   try {
     const db = getDb();
     const rows = await db.select().from(settings);
@@ -47,25 +48,26 @@ export async function initializeDefaultSettings(): Promise<void> {
   }
 
   // Step 2: Set defaults only for keys NOT already in DB/memory
-  for (const s of DEFAULTS) {
+  for (const s of DEFAULT_SETTINGS) {
     if (!memoryStore.has(s.key)) {
       memoryStore.set(s.key, s.value ?? "");
     }
   }
 
-  // Step 3: Insert defaults into DB (onDuplicateKeyUpdate won't overwrite existing values)
+  // Step 3: Insert defaults into DB (won't overwrite existing due to onDuplicateKeyUpdate)
   try {
     const db = getDb();
-    for (const s of DEFAULTS) {
+    for (const s of DEFAULT_SETTINGS) {
       await db.insert(settings).values(s).onDuplicateKeyUpdate({
-        set: { updatedAt: new Date() },
+        set: { updatedAt: new Date() },  // Only touch updatedAt, preserve existing value
       });
     }
   } catch (e: any) {
-    console.warn("[Settings] DB init failed:", e.message);
+    console.warn("DB settings init failed:", e.message);
   }
 }
 
+// ─── Core: get value (DB + memory fallback) ─────────────────────
 export async function getSettingValue(key: string): Promise<string | null> {
   // Check memory first
   const mem = memoryStore.get(key);
@@ -89,6 +91,7 @@ export async function getSettingValue(key: string): Promise<string | null> {
   return memoryStore.get(key) ?? null;
 }
 
+// ─── Core: set value (DB + memory) ──────────────────────────────
 export async function setSettingValue(key: string, value: string): Promise<void> {
   // Always update memory
   memoryStore.set(key, value);
@@ -102,7 +105,7 @@ export async function setSettingValue(key: string, value: string): Promise<void>
       await db.update(settings).set({ value, updatedAt: new Date() }).where(eq(settings.key, key));
       console.log(`[Settings] Updated ${key} in DB`);
     } else {
-      const def = DEFAULTS.find((s) => s.key === key);
+      const def = DEFAULT_SETTINGS.find((s) => s.key === key);
       await db.insert(settings).values({
         key,
         value,
@@ -115,6 +118,7 @@ export async function setSettingValue(key: string, value: string): Promise<void>
   }
 }
 
+// ─── Get all settings ────────────────────────────────────────────
 export async function findAllSettings(): Promise<Setting[]> {
   await initializeDefaultSettings();
 
@@ -127,7 +131,7 @@ export async function findAllSettings(): Promise<Setting[]> {
     }
     // Return merged (defaults + DB)
     const result: Setting[] = [];
-    for (const s of DEFAULTS) {
+    for (const s of DEFAULT_SETTINGS) {
       const dbRow = rows.find((r) => r.key === s.key);
       result.push({
         id: dbRow?.id ?? 0,
@@ -141,7 +145,7 @@ export async function findAllSettings(): Promise<Setting[]> {
     return result;
   } catch {
     // Return from memory
-    return DEFAULTS.map((s, i) => ({
+    return DEFAULT_SETTINGS.map((s, i) => ({
       id: i,
       key: s.key,
       value: memoryStore.get(s.key) ?? s.value ?? "",
@@ -152,6 +156,7 @@ export async function findAllSettings(): Promise<Setting[]> {
   }
 }
 
+// ─── Get JSON parsed value ───────────────────────────────────────
 export async function getSettingJson<T = unknown>(key: string): Promise<T | null> {
   const value = await getSettingValue(key);
   if (!value) return null;
@@ -162,15 +167,18 @@ export async function getSettingJson<T = unknown>(key: string): Promise<T | null
   }
 }
 
+// ─── Legacy: find by key ─────────────────────────────────────────
 export async function findSettingByKey(key: string): Promise<Setting | undefined> {
   const all = await findAllSettings();
   return all.find((s) => s.key === key);
 }
 
+// ─── Legacy: upsert ──────────────────────────────────────────────
 export async function upsertSetting(key: string, value: string, _description?: string): Promise<void> {
   await setSettingValue(key, value);
 }
 
+// ─── Connection status helper ────────────────────────────────────
 export async function getConnectionStatus() {
   const r = {
     pinterest: { connected: false, hasToken: false, hasBoard: false },

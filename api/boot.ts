@@ -8,6 +8,7 @@ import { env } from "./lib/env";
 import { createOAuthCallbackHandler } from "./kimi/auth";
 import { Paths } from "@contracts/constants";
 import { initializeDefaultSettings } from "./queries/settings";
+import { startScheduler } from "./services/agent";
 
 const app = new Hono<{ Bindings: HttpBindings }>();
 
@@ -19,7 +20,9 @@ app.use(bodyLimit({ maxSize: 50 * 1024 * 1024 }));
 app.use("/api/*", async (c, next) => {
   if (!settingsInitialized) {
     settingsInitialized = true;
-    initializeDefaultSettings().catch(() => {});
+    initializeDefaultSettings().catch((err) => {
+      console.warn("[Boot] Settings init warning:", err.message);
+    });
   }
   await next();
 });
@@ -45,5 +48,9 @@ if (env.isProduction) {
   const port = parseInt(process.env.PORT || "3000");
   serve({ fetch: app.fetch, port }, () => {
     console.log(`Server running on http://localhost:${port}/`);
+    // Start background scheduler in production
+    startScheduler().catch((err) => {
+      console.warn("[Boot] Scheduler start warning:", err.message);
+    });
   });
 }

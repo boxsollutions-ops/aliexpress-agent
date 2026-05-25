@@ -1,6 +1,6 @@
 /**
  * Core Agent Service
- * Manages the automated workflow: find products (AliExpress + Amazon) → add referral → publish to social
+ * Manages the automated workflow: find products → add referral → publish to social
  */
 
 import {
@@ -30,206 +30,223 @@ export function isAgentRunning(): boolean {
 
 export async function startAgent(): Promise<{ success: boolean; message: string }> {
   const enabled = await getSettingValue("agentEnabled");
+  console.log(`[Agent] startAgent called, agentEnabled=${enabled}`);
   if (enabled !== "true") {
-    return { success: false, message: "Agent is disabled in settings. Enable it first." };
+    return { success: false, message: "Agent is disabled. Enable it in Settings first." };
   }
 
   if (isRunning && agentInterval) {
     return { success: false, message: "Agent is already running" };
   }
 
-  // Check for running agent in DB
+  // Stop any stale run
   const existingRun = await findRunningAgentRun();
   if (existingRun) {
-    await completeAgentRun(existingRun.id, {
-      status: "stopped",
-      errorLog: "Stopped by new start request",
-    });
+    await completeAgentRun(existingRun.id, { status: "stopped", errorLog: "Restarted by startAgent" });
   }
 
   isRunning = true;
 
-  // Create a new agent run record
-  const agentRun = await createAgentRun({ triggeredBy: "manual" });
+  // Run first cycle immediately
+  const firstRun = await createAgentRun({ triggeredBy: "manual" });
+  console.log(`[Agent] Starting — created run #${firstRun.id}`);
+  const firstResult = await executeAgentCycle(firstRun.id);
+  console.log(`[Agent] First cycle result: ${firstResult.message}`);
 
-  // Run immediately
-  await executeAgentCycle(agentRun.id);
-
-  // Get interval from settings
+  // Setup recurring interval — each cycle gets its own agentRun
   const intervalMinutes = parseInt((await getSettingValue("agentIntervalMinutes")) ?? "15", 10);
   const intervalMs = Math.max(intervalMinutes, 1) * 60 * 1000;
+  console.log(`[Agent] Scheduling every ${intervalMinutes} min (${intervalMs}ms)`);
 
-  // Schedule recurring runs
   agentInterval = setInterval(async () => {
     if (!isRunning) return;
-    await executeAgentCycle(agentRun.id);
+    try {
+      const newRun = await createAgentRun({ triggeredBy: "scheduler" });
+      console.log(`[Agent] Scheduled cycle — run #${newRun.id}`);
+      const result = await executeAgentCycle(newRun.id);
+      console.log(`[Agent] Scheduled cycle result: ${result.message}`);
+    } catch (err: any) {
+      console.error(`[Agent] Scheduled cycle crashed:`, err.message);
+    }
   }, intervalMs);
 
-  return {
-    success: true,
-    message: `Agent started with ${intervalMinutes} minute interval`,
-  };
+  return { success: true, message: `Agent started (${intervalMinutes} min interval). ${firstResult.message}` };
 }
 
 export async function stopAgent(): Promise<{ success: boolean; message: string }> {
   isRunning = false;
-
-  if (agentInterval) {
-    clearInterval(agentInterval);
-    agentInterval = null;
-  }
-
-  // Mark any running agent runs as stopped
+  if (agentInterval) { clearInterval(agentInterval); agentInterval = null; }
   const existingRun = await findRunningAgentRun();
   if (existingRun) {
-    await completeAgentRun(existingRun.id, {
-      status: "stopped",
-      errorLog: "Stopped by user",
-    });
+    await completeAgentRun(existingRun.id, { status: "stopped", errorLog: "Stopped by user" });
   }
-
   return { success: true, message: "Agent stopped" };
 }
 
 export async function runOnce(): Promise<{ success: boolean; message: string }> {
   const enabled = await getSettingValue("agentEnabled");
+  console.log(`[Agent] runOnce called, agentEnabled=${enabled}`);
   if (enabled !== "true") {
-    return { success: false, message: "Agent is disabled in settings. Enable it first." };
+    return { success: false, message: "Agent is disabled. Enable it in Settings first." };
   }
-
-  const agentRun = await createAgentRun({ triggeredBy: "manual" });
-  const result = await executeAgentCycle(agentRun.id);
-
-  return {
-    success: result.success,
-    message: result.message,
-  };
+  try {
+    const agentRun = await createAgentRun({ triggeredBy: "manual" });
+    console.log(`[Agent] RunOnce — created run #${agentRun.id}`);
+    const result = await executeAgentCycle(agentRun.id);
+    console.log(`[Agent] RunOnce result: ${result.message}`);
+    return result;
+  } catch (err: any) {
+    console.error(`[Agent] RunOnce crashed:`, err.message);
+    return { success: false, message: `RunOnce failed: ${err.message}` };
+  }
 }
 
-async function executeAgentCycle(
-  runId: number
-): Promise<{ success: boolean; message: string }> {
+async function executeAgentCycle(runId: number): Promise<{ success: boolean; message: string }> {
+  console.log(`[Agent] === executeAgentCycle #${runId} START ===`);
   let productsFound = 0;
   let productsPosted = 0;
   let errorsCount = 0;
   const errorLogs: string[] = [];
 
   try {
-    // Determine which source to use this cycle
-    const sources = await getSettingJson<("aliexpress" | "amazon")[]>("productSources");
-    const activeSources = sources ?? ["aliexpress", "amazon"];
-    const source = activeSources[Math.floor(Math.random() * activeSources.length)];
+    // ── Step 1: Choose source ──
+    let sources: ("aliexpress" | "amazon")[];
+    try {
+      sources = await getSettingJson<("aliexpress" | "amazon")[]>("productSources") ?? ["aliexpress", "amazon"];
+    } catch (e: any) {
+      console.warn(`[Agent] Failed to read productSources, using default: ${e.message}`);
+      sources = ["aliexpress", "amazon"];
+    }
+    const source = sources[Math.floor(Math.random() * sources.length)];
+    console.log(`[Agent] Selected source: ${source}`);
 
-    // Get category based on source
+    // ── Step 2: Fetch trending products ──
     let trendingProducts: Array<{
-      productId: string;
-      title: string;
-      description: string;
-      price: number;
-      originalPrice?: number;
-      currency: string;
-      imageUrl: string;
-      productUrl: string;
-      category: string;
-      rating: number;
-      reviewsCount: number;
-      ordersCount: number;
-      storeName: string;
-      isTrending: boolean;
-      trendingRank?: number;
+      productId: string; title: string; description: string;
+      price: number; originalPrice?: number; currency: string;
+      imageUrl: string; productUrl: string; category: string;
+      rating: number; reviewsCount: number; ordersCount: number;
+      storeName: string; isTrending: boolean; trendingRank?: number;
     }>;
 
-    if (source === "amazon") {
-      const categories = await getSettingJson<string[]>("amazonProductCategories");
-      const category = categories?.[Math.floor(Math.random() * (categories?.length ?? 1))];
-      trendingProducts = await searchTrendingAmazonProducts(category, 5);
-    } else {
-      const categories = await getSettingJson<string[]>("productCategories");
-      const category = categories?.[Math.floor(Math.random() * (categories?.length ?? 1))];
-      trendingProducts = await searchTrendingProducts(category, 5);
+    try {
+      if (source === "amazon") {
+        const cats = await getSettingJson<string[]>("amazonProductCategories");
+        trendingProducts = await searchTrendingAmazonProducts(cats?.[0], 5);
+      } else {
+        const cats = await getSettingJson<string[]>("productCategories");
+        trendingProducts = await searchTrendingProducts(cats?.[0], 5);
+      }
+      productsFound = trendingProducts.length;
+      console.log(`[Agent] Found ${productsFound} ${source} products`);
+    } catch (err: any) {
+      console.error(`[Agent] Product search failed: ${err.message}`);
+      await completeAgentRun(runId, { status: "failed", productsFound: 0, productsPosted: 0, errorsCount: 1, errorLog: `Search failed: ${err.message}` });
+      return { success: false, message: `Product search failed: ${err.message}` };
     }
 
-    productsFound = trendingProducts.length;
+    // ── Step 3: Insert to DB ──
+    try {
+      const insertData: InsertProduct[] = trendingProducts.map((p) => ({
+        source: source as "aliexpress" | "amazon",
+        productId: p.productId,
+        title: p.title,
+        description: p.description,
+        price: String(p.price),
+        originalPrice: p.originalPrice ? String(p.originalPrice) : null,
+        currency: p.currency,
+        imageUrl: p.imageUrl,
+        productUrl: p.productUrl,
+        category: p.category,
+        rating: String(p.rating),
+        reviewsCount: p.reviewsCount,
+        ordersCount: p.ordersCount,
+        storeName: p.storeName,
+        isTrending: p.isTrending,
+        trendingRank: p.trendingRank,
+        status: "new" as const,
+      }));
+      await createProductsBulk(insertData);
+      console.log(`[Agent] Inserted ${insertData.length} products into DB`);
+    } catch (err: any) {
+      console.error(`[Agent] Product insert failed: ${err.message}`);
+      errorLogs.push(`Insert: ${err.message}`);
+      errorsCount++;
+    }
 
-    // Insert products into DB
-    const insertData: InsertProduct[] = trendingProducts.map((p) => ({
-      source: source as "aliexpress" | "amazon",
-      productId: p.productId,
-      title: p.title,
-      description: p.description,
-      price: String(p.price),
-      originalPrice: p.originalPrice ? String(p.originalPrice) : null,
-      currency: p.currency,
-      imageUrl: p.imageUrl,
-      productUrl: p.productUrl,
-      category: p.category,
-      rating: String(p.rating),
-      reviewsCount: p.reviewsCount,
-      ordersCount: p.ordersCount,
-      storeName: p.storeName,
-      isTrending: p.isTrending,
-      trendingRank: p.trendingRank,
-      status: "new" as const,
-    }));
-
-    await createProductsBulk(insertData);
-
-    // Step 2: Process unposted products
-    const unpostedProducts = await findUnpostedProducts();
+    // ── Step 4: Get unposted products ──
+    let unpostedProducts: Awaited<ReturnType<typeof findUnpostedProducts>>;
+    try {
+      unpostedProducts = await findUnpostedProducts();
+      console.log(`[Agent] Unposted products: ${unpostedProducts.length}`);
+    } catch (err: any) {
+      console.error(`[Agent] findUnpostedProducts failed: ${err.message}`);
+      await completeAgentRun(runId, { status: "failed", productsFound, productsPosted: 0, errorsCount: errorsCount + 1, errorLog: `DB query failed: ${err.message}` });
+      return { success: false, message: `DB query failed: ${err.message}` };
+    }
 
     if (unpostedProducts.length === 0) {
-      await completeAgentRun(runId, {
-        status: "completed",
-        productsFound,
-        productsPosted: 0,
-      });
-      return { success: true, message: `Found ${productsFound} ${source} products. No new products to post.` };
+      console.log(`[Agent] No unposted products to process`);
+      await completeAgentRun(runId, { status: "completed", productsFound, productsPosted: 0 });
+      return { success: true, message: `Found ${productsFound} ${source} products. None to post.` };
     }
 
-    // Step 3: Add referral links
-    const aliReferralBase = await getSettingValue("referralBaseUrl");
-    const amazonReferralBase = await getSettingValue("amazonReferralUrl");
-    const productsToPost = unpostedProducts.slice(0, 1); // Post 1 product per cycle
+    // ── Step 5: Add referral and post ──
+    const aliReferral = await getSettingValue("referralBaseUrl");
+    const amazonReferral = await getSettingValue("amazonReferralUrl");
+    const productsToPost = unpostedProducts.slice(0, 1);
 
     for (const product of productsToPost) {
+      console.log(`[Agent] Processing product #${product.id}: ${product.title?.slice(0, 60)}`);
+
       try {
-        // Generate referral URL based on product source
+        // 5a: Generate referral URL
         let referralUrl: string;
-        if (product.source === "amazon" && amazonReferralBase) {
-          referralUrl = generateAmazonReferralUrl(product.productUrl, amazonReferralBase);
-        } else if (product.source === "amazon") {
+        try {
+          if (product.source === "amazon" && amazonReferral) {
+            referralUrl = generateAmazonReferralUrl(product.productUrl, amazonReferral);
+          } else {
+            referralUrl = generateReferralUrl(product.productUrl, aliReferral ?? "");
+          }
+          console.log(`[Agent] Referral URL: ${referralUrl.slice(0, 80)}...`);
+        } catch (err: any) {
           referralUrl = product.productUrl;
-        } else {
-          referralUrl = generateReferralUrl(product.productUrl, aliReferralBase ?? "");
+          console.warn(`[Agent] Referral generation failed, using productUrl: ${err.message}`);
         }
 
-        await updateProduct(product.id, {
-          referralUrl,
-          status: "processed",
-        });
-
-        // Step 4: Post to enabled platforms
-        const platforms = await getSettingJson<("pinterest" | "linkedin" | "telegram")[]>(
-          "targetPlatforms"
-        );
-
-        if (!platforms || platforms.length === 0) {
-          errorLogs.push("No target platforms configured");
+        // 5b: Update product
+        try {
+          await updateProduct(product.id, { referralUrl, status: "processed" });
+          console.log(`[Agent] Product #${product.id} marked as processed`);
+        } catch (err: any) {
+          console.error(`[Agent] Failed to update product: ${err.message}`);
+          errorLogs.push(`Product update: ${err.message}`);
           errorsCount++;
           continue;
         }
 
-        for (const platform of platforms) {
-          try {
-            // Create post record
-            const post = await createPost({
-              productId: product.id,
-              platform,
-              status: "pending",
-              scheduledAt: new Date(),
-            });
+        // 5c: Get target platforms
+        let targetPlatforms: ("pinterest" | "linkedin" | "telegram")[];
+        try {
+          targetPlatforms = await getSettingJson<("pinterest" | "linkedin" | "telegram")[]>("targetPlatforms") ?? ["pinterest", "linkedin", "telegram"];
+        } catch (e: any) {
+          targetPlatforms = ["pinterest", "linkedin", "telegram"];
+        }
+        if (targetPlatforms.length === 0) {
+          console.warn(`[Agent] No target platforms configured`);
+          errorLogs.push("No target platforms configured");
+          errorsCount++;
+          continue;
+        }
+        console.log(`[Agent] Target platforms: ${targetPlatforms.join(", ")}`);
 
-            // Publish to platform
+        // 5d: Post to each platform
+        for (const platform of targetPlatforms) {
+          try {
+            console.log(`[Agent] Posting to ${platform}...`);
+            const post = await createPost({ productId: product.id, platform, status: "pending", scheduledAt: new Date() });
+            console.log(`[Agent] Created post #${post.id} for ${platform}`);
+
             const result = await publishToPlatform(platform, {
               title: product.title,
               description: product.description ?? "",
@@ -241,94 +258,103 @@ async function executeAgentCycle(
             });
 
             if (result.success) {
-              await updatePostStatus(post.id, "published", {
-                platformPostId: result.platformPostId,
-                postUrl: result.postUrl,
-              });
+              await updatePostStatus(post.id, "published", { platformPostId: result.platformPostId, postUrl: result.postUrl });
+              console.log(`[Agent] ✅ Published to ${platform}: ${result.postUrl ?? "no url"}`);
               productsPosted++;
             } else {
-              await updatePostStatus(post.id, "failed", {
-                errorMessage: result.error,
-              });
+              await updatePostStatus(post.id, "failed", { errorMessage: result.error });
+              console.warn(`[Agent] ❌ ${platform}: ${result.error}`);
               errorLogs.push(`${platform}: ${result.error}`);
               errorsCount++;
             }
-          } catch (error) {
-            const msg = error instanceof Error ? error.message : "Unknown error";
-            errorLogs.push(`${platform}: ${msg}`);
+          } catch (err: any) {
+            console.error(`[Agent] ${platform} error: ${err.message}`);
+            errorLogs.push(`${platform}: ${err.message}`);
             errorsCount++;
           }
         }
 
-        // Mark product as posted
-        await updateProductStatus(product.id, "posted");
-      } catch (error) {
-        const msg = error instanceof Error ? error.message : "Unknown error";
-        errorLogs.push(`Product ${product.id}: ${msg}`);
+        // 5e: Mark as posted
+        try {
+          await updateProductStatus(product.id, "posted");
+          console.log(`[Agent] Product #${product.id} marked as posted`);
+        } catch (err: any) {
+          console.error(`[Agent] Failed to mark posted: ${err.message}`);
+        }
+
+      } catch (err: any) {
+        console.error(`[Agent] Product ${product.id} error: ${err.message}`);
+        errorLogs.push(`Product ${product.id}: ${err.message}`);
         errorsCount++;
-        await updateProductStatus(product.id, "error");
+        try {
+          await updateProductStatus(product.id, "error");
+        } catch {
+          // ignore
+        }
       }
     }
 
-    // Update agent run with results
+    // ── Step 6: Complete run ──
+    const finalStatus = errorsCount > 0 && productsPosted === 0 ? "failed" : "completed";
     await completeAgentRun(runId, {
-      status: errorsCount > 0 && productsPosted === 0 ? "failed" : "completed",
-      productsFound,
-      productsPosted,
-      errorsCount,
+      status: finalStatus,
+      productsFound, productsPosted, errorsCount,
       errorLog: errorLogs.join("\n") || undefined,
     });
 
-    return {
-      success: productsPosted > 0,
-      message: `Cycle complete. Source: ${source}. Found ${productsFound} products, posted ${productsPosted}. Errors: ${errorsCount}`,
-    };
-  } catch (error) {
-    const msg = error instanceof Error ? error.message : "Unknown error";
+    const message = `Source: ${source}. Found: ${productsFound}, Posted: ${productsPosted}, Errors: ${errorsCount}`;
+    console.log(`[Agent] === Cycle #${runId} END: ${finalStatus} — ${message} ===`);
+    return { success: productsPosted > 0, message };
+
+  } catch (err: any) {
+    console.error(`[Agent] === Cycle #${runId} CRASHED: ${err.message} ===`);
     await completeAgentRun(runId, {
       status: "failed",
-      productsFound,
-      productsPosted,
-      errorsCount: errorsCount + 1,
-      errorLog: msg,
+      productsFound, productsPosted, errorsCount: errorsCount + 1,
+      errorLog: err.message,
     });
-    return { success: false, message: `Agent cycle failed: ${msg}` };
+    return { success: false, message: `Agent cycle crashed: ${err.message}` };
   }
 }
 
-// Scheduler for automatic background runs
+// ─── Background Scheduler ─────────────────────────────────────────
 let schedulerInterval: ReturnType<typeof setInterval> | null = null;
+let schedulerStarted = false;
 
 export async function startScheduler(): Promise<void> {
-  // Stop existing scheduler
-  if (schedulerInterval) {
-    clearInterval(schedulerInterval);
-    schedulerInterval = null;
-  }
+  if (schedulerStarted) return;
+  schedulerStarted = true;
+
+  if (schedulerInterval) { clearInterval(schedulerInterval); schedulerInterval = null; }
 
   const intervalMinutes = parseInt((await getSettingValue("agentIntervalMinutes")) ?? "15", 10);
   const intervalMs = Math.max(intervalMinutes, 1) * 60 * 1000;
 
+  console.log(`[Agent] Background scheduler started (${intervalMinutes} min interval)`);
+
   schedulerInterval = setInterval(async () => {
-    const enabled = await getSettingValue("agentEnabled");
-    if (enabled !== "true") return;
-
-    const existingRun = await findRunningAgentRun();
-    if (existingRun) return; // Don't run if already running
-
-    const agentRun = await createAgentRun({ triggeredBy: "scheduler" });
-    await executeAgentCycle(agentRun.id);
+    try {
+      const enabled = await getSettingValue("agentEnabled");
+      if (enabled !== "true") {
+        console.log(`[Agent] Scheduler: agent disabled, skipping`);
+        return;
+      }
+      const existingRun = await findRunningAgentRun();
+      if (existingRun) {
+        console.log(`[Agent] Scheduler: run #${existingRun.id} already active, skipping`);
+        return;
+      }
+      const agentRun = await createAgentRun({ triggeredBy: "scheduler" });
+      console.log(`[Agent] Scheduler: starting cycle #${agentRun.id}`);
+      const result = await executeAgentCycle(agentRun.id);
+      console.log(`[Agent] Scheduler: cycle #${agentRun.id} result: ${result.message}`);
+    } catch (err: any) {
+      console.error(`[Agent] Scheduler error:`, err.message);
+    }
   }, intervalMs);
 }
 
 export function stopScheduler(): void {
-  if (schedulerInterval) {
-    clearInterval(schedulerInterval);
-    schedulerInterval = null;
-  }
+  schedulerStarted = false;
+  if (schedulerInterval) { clearInterval(schedulerInterval); schedulerInterval = null; }
 }
-
-// Initialize scheduler on module load
-startScheduler().catch(() => {
-  // Silently fail - scheduler will be started when settings are configured
-});

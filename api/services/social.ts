@@ -12,7 +12,14 @@ export interface PublishResult {
   error?: string;
 }
 
-// ─── Pinterest Publisher ────────────────────────────────────
+// ─── TEST MODE ────────────────────────────────────────────────────
+// When true, simulates posting without real API calls
+let testMode = false;
+export function setTestMode(enabled: boolean) {
+  testMode = enabled;
+}
+
+// ─── Pinterest Publisher ──────────────────────────────────────────
 
 export async function publishToPinterest(options: {
   title: string;
@@ -20,56 +27,45 @@ export async function publishToPinterest(options: {
   imageUrl: string;
   destinationUrl: string;
 }): Promise<PublishResult> {
+  const accessToken = await getSettingValue("pinterestAccessToken");
+  const boardId = await getSettingValue("pinterestBoardId");
+
+  if (!accessToken) return { success: false, error: "Pinterest access token not configured" };
+  if (!boardId) return { success: false, error: "Pinterest board ID not configured" };
+
+  if (testMode || accessToken.startsWith("pina_test")) {
+    console.log("[TEST] Pinterest pin would be created:", options.title);
+    return {
+      success: true,
+      platformPostId: `test-pin-${Date.now()}`,
+      postUrl: `https://pinterest.com/pin/test-${Date.now()}`,
+    };
+  }
+
   try {
-    const accessToken = await getSettingValue("pinterestAccessToken");
-    const boardId = await getSettingValue("pinterestBoardId");
-
-    if (!accessToken) {
-      return { success: false, error: "Pinterest access token not configured" };
-    }
-    if (!boardId) {
-      return { success: false, error: "Pinterest board ID not configured" };
-    }
-
     const response = await fetch("https://api.pinterest.com/v5/pins", {
       method: "POST",
-      headers: {
-        Authorization: `Bearer ${accessToken}`,
-        "Content-Type": "application/json",
-      },
+      headers: { Authorization: `Bearer ${accessToken}`, "Content-Type": "application/json" },
       body: JSON.stringify({
         title: options.title.slice(0, 100),
         description: options.description.slice(0, 500),
         board_id: boardId,
-        media_source: {
-          source_type: "image_url",
-          url: options.imageUrl,
-        },
+        media_source: { source_type: "image_url", url: options.imageUrl },
         destination_url: options.destinationUrl,
       }),
     });
-
     if (!response.ok) {
-      const errorText = await response.text();
-      return { success: false, error: `Pinterest API error: ${errorText}` };
+      const err = await response.text();
+      return { success: false, error: `Pinterest API: ${err.slice(0, 200)}` };
     }
-
-    // eslint-disable-next-line @typescript-eslint/no-explicit-any
-    const data = (await response.json()) as any;
-    return {
-      success: true,
-      platformPostId: data.id as string,
-      postUrl: (data.link as string) ?? `https://pinterest.com/pin/${data.id as string}`,
-    };
-  } catch (error) {
-    return {
-      success: false,
-      error: `Pinterest publish failed: ${error instanceof Error ? error.message : "Unknown error"}`,
-    };
+    const data = (await response.json()) as { id: string; link?: string };
+    return { success: true, platformPostId: data.id, postUrl: data.link ?? `https://pinterest.com/pin/${data.id}` };
+  } catch (e: any) {
+    return { success: false, error: `Pinterest: ${e.message}` };
   }
 }
 
-// ─── LinkedIn Publisher ─────────────────────────────────────
+// ─── LinkedIn Publisher ───────────────────────────────────────────
 
 export async function publishToLinkedIn(options: {
   title: string;
@@ -77,47 +73,28 @@ export async function publishToLinkedIn(options: {
   imageUrl: string;
   destinationUrl: string;
 }): Promise<PublishResult> {
+  const accessToken = await getSettingValue("linkedinAccessToken");
+  const userId = await getSettingValue("linkedinUserId");
+
+  if (!accessToken) return { success: false, error: "LinkedIn access token not configured" };
+  if (!userId) return { success: false, error: "LinkedIn user ID not configured" };
+
+  if (testMode || accessToken.startsWith("test_")) {
+    console.log("[TEST] LinkedIn post would be created:", options.title);
+    return { success: true, platformPostId: `test-li-${Date.now()}`, postUrl: options.destinationUrl };
+  }
+
   try {
-    const accessToken = await getSettingValue("linkedinAccessToken");
-    const userId = await getSettingValue("linkedinUserId");
-
-    if (!accessToken) {
-      return { success: false, error: "LinkedIn access token not configured" };
-    }
-    if (!userId) {
-      return { success: false, error: "LinkedIn user ID not configured" };
-    }
-
-    // First, upload image if URL provided
-    let imageUrn: string | undefined;
-    if (options.imageUrl) {
-      imageUrn = await uploadLinkedInImage(accessToken, userId, options.imageUrl);
-    }
-
-    // Create the share
-    const shareBody: Record<string, unknown> = {
+    const shareBody = {
       author: userId,
-      lifecycleState: "PUBLISHED",
+      lifecycleState: "PUBLISHED" as const,
       specificContent: {
         "com.linkedin.ugc.ShareContent": {
-          shareCommentary: {
-            text: `${options.title}\n\n${options.description}\n\nCheck it out: ${options.destinationUrl}`,
-          },
-          shareMediaCategory: imageUrn ? "IMAGE" : "NONE",
-          ...(imageUrn && {
-            media: [
-              {
-                status: "READY",
-                media: imageUrn,
-                title: { text: options.title },
-              },
-            ],
-          }),
+          shareCommentary: { text: `${options.title}\n\n${options.description}\n\n${options.destinationUrl}` },
+          shareMediaCategory: "NONE" as const,
         },
       },
-      visibility: {
-        "com.linkedin.ugc.MemberNetworkVisibility": "PUBLIC",
-      },
+      visibility: { "com.linkedin.ugc.MemberNetworkVisibility": "PUBLIC" as const },
     };
 
     const response = await fetch("https://api.linkedin.com/v2/ugcPosts", {
@@ -131,88 +108,17 @@ export async function publishToLinkedIn(options: {
     });
 
     if (!response.ok) {
-      return {
-        success: true,
-        platformPostId: `demo-${Date.now()}`,
-        postUrl: options.destinationUrl,
-      };
+      const err = await response.text();
+      return { success: false, error: `LinkedIn API: ${response.status} ${err.slice(0, 200)}` };
     }
-
-    // eslint-disable-next-line @typescript-eslint/no-explicit-any
-    const data = (await response.json()) as any;
-    return {
-      success: true,
-      platformPostId: data.id as string,
-      postUrl: `https://www.linkedin.com/feed/update/${data.id as string}`,
-    };
-  } catch (error) {
-    return {
-      success: false,
-      error: `LinkedIn publish failed: ${error instanceof Error ? error.message : "Unknown error"}`,
-    };
+    const data = (await response.json()) as { id: string };
+    return { success: true, platformPostId: data.id, postUrl: `https://www.linkedin.com/feed/update/${data.id}` };
+  } catch (e: any) {
+    return { success: false, error: `LinkedIn: ${e.message}` };
   }
 }
 
-async function uploadLinkedInImage(
-  accessToken: string,
-  userId: string,
-  imageUrl: string
-): Promise<string | undefined> {
-  try {
-    // Register upload
-    const registerResponse = await fetch(
-      "https://api.linkedin.com/v2/assets?action=registerUpload",
-      {
-        method: "POST",
-        headers: {
-          Authorization: `Bearer ${accessToken}`,
-          "Content-Type": "application/json",
-        },
-        body: JSON.stringify({
-          registerUploadRequest: {
-            owner: userId,
-            recipes: ["urn:li:digitalmediaRecipe:feedshare-image"],
-            serviceRelationships: [
-              {
-                relationshipType: "OWNER",
-                identifier: "urn:li:userGeneratedContent",
-              },
-            ],
-          },
-        }),
-      }
-    );
-
-    if (!registerResponse.ok) return undefined;
-
-    // eslint-disable-next-line @typescript-eslint/no-explicit-any
-    const registerData = (await registerResponse.json()) as any;
-    const uploadUrl = registerData.value?.uploadMechanism?.[
-      "com.linkedin.digitalmedia.uploading.MediaUploadHttpRequest"
-    ]?.uploadUrl as string | undefined;
-    const asset = registerData.value?.asset as string | undefined;
-
-    if (!uploadUrl || !asset) return undefined;
-
-    // Fetch image and upload
-    const imageResponse = await fetch(imageUrl);
-    const imageBlob = await imageResponse.blob();
-
-    await fetch(uploadUrl, {
-      method: "PUT",
-      headers: {
-        Authorization: `Bearer ${accessToken}`,
-      },
-      body: imageBlob,
-    });
-
-    return asset;
-  } catch {
-    return undefined;
-  }
-}
-
-// ─── Telegram Publisher ─────────────────────────────────────
+// ─── Telegram Publisher ───────────────────────────────────────────
 
 export async function publishToTelegram(options: {
   title: string;
@@ -223,89 +129,62 @@ export async function publishToTelegram(options: {
   rating: string;
   orders: string;
 }): Promise<PublishResult> {
+  const botToken = await getSettingValue("telegramBotToken");
+  const channelId = await getSettingValue("telegramChannelId");
+
+  if (!botToken) return { success: false, error: "Telegram bot token not configured" };
+  if (!channelId) return { success: false, error: "Telegram channel ID not configured" };
+
+  if (testMode || botToken.startsWith("test_")) {
+    console.log("[TEST] Telegram message would be sent:", options.title);
+    return { success: true, platformPostId: `test-tg-${Date.now()}`, postUrl: `https://t.me/${channelId.replace(/^@/, "")}/test` };
+  }
+
   try {
-    const botToken = await getSettingValue("telegramBotToken");
-    const channelId = await getSettingValue("telegramChannelId");
-
-    if (!botToken) {
-      return { success: false, error: "Telegram bot token not configured" };
-    }
-    if (!channelId) {
-      return { success: false, error: "Telegram channel ID not configured" };
-    }
-
-    // Build caption from template
-    const template = await getSettingValue("postTemplate");
-    const caption = (template ?? getDefaultTelegramTemplate())
+    const template = (await getSettingValue("postTemplate")) ?? getDefaultTelegramTemplate();
+    const caption = template
       .replace(/{title}/g, options.title)
       .replace(/{description}/g, options.description)
       .replace(/{price}/g, options.price)
       .replace(/{rating}/g, options.rating)
       .replace(/{orders}/g, options.orders)
-      .replace(/{referralUrl}/g, options.destinationUrl);
+      .replace(/{referralUrl}/g, options.destinationUrl)
+      .slice(0, 1024);
 
-    // Send photo with caption
-    const response = await fetch(
-      `https://api.telegram.org/bot${botToken}/sendPhoto`,
-      {
-        method: "POST",
-        headers: {
-          "Content-Type": "application/json",
-        },
-        body: JSON.stringify({
-          chat_id: channelId,
-          photo: options.imageUrl,
-          caption: caption.slice(0, 1024),
-          parse_mode: "HTML",
-          reply_markup: {
-            inline_keyboard: [
-              [
-                {
-                  text: "Buy Now",
-                  url: options.destinationUrl,
-                },
-              ],
-            ],
-          },
-        }),
-      }
-    );
+    const response = await fetch(`https://api.telegram.org/bot${botToken}/sendPhoto`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        chat_id: channelId,
+        photo: options.imageUrl,
+        caption,
+        parse_mode: "HTML",
+        reply_markup: { inline_keyboard: [[{ text: "Buy Now", url: options.destinationUrl }]] },
+      }),
+    });
 
     if (!response.ok) {
-      const errorText = await response.text();
-      return { success: false, error: `Telegram API error: ${errorText}` };
+      const err = await response.text();
+      return { success: false, error: `Telegram API: ${err.slice(0, 200)}` };
     }
-
-    // eslint-disable-next-line @typescript-eslint/no-explicit-any
-    const data = (await response.json()) as any;
-    if (!data.ok) {
-      return { success: false, error: `Telegram error: ${data.description as string}` };
-    }
-
+    const data = (await response.json()) as { ok: boolean; result?: { message_id: number }; description?: string };
+    if (!data.ok) return { success: false, error: `Telegram: ${data.description ?? "unknown error"}` };
+    if (!data.result) return { success: false, error: "Telegram: no result" };
     return {
       success: true,
-      platformPostId: String(data.result.message_id as number),
-      postUrl: `https://t.me/${channelId.replace(/^@/, "")}/${String(data.result.message_id as number)}`,
+      platformPostId: String(data.result.message_id),
+      postUrl: `https://t.me/${channelId.replace(/^@/, "")}/${data.result.message_id}`,
     };
-  } catch (error) {
-    return {
-      success: false,
-      error: `Telegram publish failed: ${error instanceof Error ? error.message : "Unknown error"}`,
-    };
+  } catch (e: any) {
+    return { success: false, error: `Telegram: ${e.message}` };
   }
 }
 
 function getDefaultTelegramTemplate(): string {
-  return `🔥 <b>{title}</b>
-
-💰 Price: ${"{price}"}
-⭐ Rating: {rating}/5
-🛒 Orders: {orders}
-
-👇 <a href="{referralUrl}">Get it now</a>`;
+  return `🔥 <b>{title}</b>\n\n💰 Price: {price}\n⭐ Rating: {rating}/5\n🛒 Orders: {orders}\n\n👇 <a href="{referralUrl}">Get it now</a>`;
 }
 
-// ─── Generic Publisher ──────────────────────────────────────
+// ─── Generic Publisher ────────────────────────────────────────────
 
 export async function publishToPlatform(
   platform: "pinterest" | "linkedin" | "telegram",
@@ -344,7 +223,5 @@ export async function publishToPlatform(
         rating: options.rating ?? "",
         orders: options.orders ?? "",
       });
-    default:
-      return { success: false, error: `Unknown platform: ${platform}` };
   }
 }

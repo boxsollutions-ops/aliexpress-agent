@@ -1,5 +1,6 @@
 /**
- * Web Search Utility - uses web_search tool via API
+ * Web Search Utility
+ * Uses web_search tool to find trending products
  */
 
 export interface SearchResult {
@@ -12,21 +13,31 @@ export interface SearchResult {
 
 export async function search(query: string): Promise<SearchResult> {
   try {
-    // Call the web_search through the API
-    const response = await fetch("https://api.bflow.com/search", {
-      method: "POST",
+    // Use web_search API
+    const response = await fetch("https://api.bing.microsoft.com/v7.0/search?q=" + encodeURIComponent(query), {
+      method: "GET",
       headers: {
-        "Content-Type": "application/json",
+        "Ocp-Apim-Subscription-Key": process.env.BING_API_KEY ?? "",
       },
-      body: JSON.stringify({ q: query, num: 10 }),
     });
 
     if (!response.ok) {
       return { organic_results: [] };
     }
 
-    return (await response.json()) as SearchResult;
+    const data = (await response.json()) as {
+      webPages?: { value?: Array<{ name?: string; url?: string; snippet?: string }> };
+    };
+
+    const results = (data.webPages?.value ?? []).map((item) => ({
+      title: item.name ?? "",
+      link: item.url ?? "",
+      snippet: item.snippet ?? "",
+    }));
+
+    return { organic_results: results };
   } catch {
+    // Fallback: return empty results
     return { organic_results: [] };
   }
 }
