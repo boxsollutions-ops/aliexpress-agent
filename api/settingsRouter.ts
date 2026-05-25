@@ -3,7 +3,6 @@ import { createRouter, publicQuery } from "./middleware";
 import {
   findAllSettings,
   findSettingByKey,
-  updateSetting,
   upsertSetting,
   getSettingValue,
   getSettingJson,
@@ -12,6 +11,7 @@ import {
 
 export const settingsRouter = createRouter({
   list: publicQuery.query(async () => {
+    await initializeDefaultSettings();
     return findAllSettings();
   }),
 
@@ -43,7 +43,7 @@ export const settingsRouter = createRouter({
       })
     )
     .mutation(async ({ input }) => {
-      await updateSetting(input.key, input.value);
+      await upsertSetting(input.key, input.value);
       return { success: true };
     }),
 
@@ -71,7 +71,7 @@ export const settingsRouter = createRouter({
     )
     .mutation(async ({ input }) => {
       for (const item of input) {
-        await updateSetting(item.key, item.value);
+        await upsertSetting(item.key, item.value);
       }
       return { success: true };
     }),
@@ -81,8 +81,8 @@ export const settingsRouter = createRouter({
     return { success: true };
   }),
 
-  // Get all social media connection statuses
   connectionStatus: publicQuery.query(async () => {
+    await initializeDefaultSettings();
     const pinterestToken = await getSettingValue("pinterestAccessToken");
     const pinterestBoard = await getSettingValue("pinterestBoardId");
     const linkedinToken = await getSettingValue("linkedinAccessToken");

@@ -4,12 +4,11 @@ import { postRouter } from "./postRouter";
 import { settingsRouter } from "./settingsRouter";
 import { agentRouter } from "./agentRouter";
 import { templateRouter } from "./templateRouter";
-import { createRouter, publicQuery } from "./middleware";
 import { initializeDefaultSettings } from "./queries/settings";
+import { createRouter, publicQuery } from "./middleware";
 
-// Initialize default settings on first load
-initializeDefaultSettings().catch(() => {
-  // Will be initialized on first API call
+initializeDefaultSettings().catch((err) => {
+  console.warn("Settings init warning:", err.message);
 });
 
 export const appRouter = createRouter({
