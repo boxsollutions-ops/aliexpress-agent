@@ -4,10 +4,7 @@ import { postRouter } from "./postRouter";
 import { settingsRouter } from "./settingsRouter";
 import { agentRouter } from "./agentRouter";
 import { templateRouter } from "./templateRouter";
-import { initializeDefaultSettings } from "./queries/settings";
 import { createRouter, publicQuery } from "./middleware";
-
-initializeDefaultSettings().catch(() => {});
 
 export const appRouter = createRouter({
   ping: publicQuery.query(() => ({ ok: true, ts: Date.now() })),

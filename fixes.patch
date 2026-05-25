@@ -1,0 +1,193 @@
+diff --git a/api/agentRouter.ts b/api/agentRouter.ts
+index 857d46c..43c29f3 100644
+--- a/api/agentRouter.ts
++++ b/api/agentRouter.ts
+@@ -23,7 +23,9 @@ export const agentRouter = createRouter({
+     return stopAgent();
+   }),
+ 
+-  runOnce: publicQuery.mutation(async () => {
++  runOnce: publicQuery
++    .input(z.object({}).optional())
++    .mutation(async () => {
+     return runOnce();
+   }),
+ 
+diff --git a/api/boot.ts b/api/boot.ts
+index 1e0748c..6e5074f 100644
+--- a/api/boot.ts
++++ b/api/boot.ts
+@@ -7,10 +7,23 @@ import { createContext } from "./context";
+ import { env } from "./lib/env";
+ import { createOAuthCallbackHandler } from "./kimi/auth";
+ import { Paths } from "@contracts/constants";
++import { initializeDefaultSettings } from "./queries/settings";
+ 
+ const app = new Hono<{ Bindings: HttpBindings }>();
+ 
++let settingsInitialized = false;
++
+ app.use(bodyLimit({ maxSize: 50 * 1024 * 1024 }));
++
++// Lazy initialize settings on first request
++app.use("/api/*", async (c, next) => {
++  if (!settingsInitialized) {
++    settingsInitialized = true;
++    initializeDefaultSettings().catch(() => {});
++  }
++  await next();
++});
++
+ app.get(Paths.oauthCallback, createOAuthCallbackHandler());
+ app.use("/api/trpc/*", async (c) => {
+   return fetchRequestHandler({
+diff --git a/api/queries/settings.ts b/api/queries/settings.ts
+index f6c610b..bbac3f0 100644
+--- a/api/queries/settings.ts
++++ b/api/queries/settings.ts
+@@ -33,19 +33,37 @@ export async function initializeDefaultSettings(): Promise<void> {
+   if (initDone) return;
+   initDone = true;
+ 
++  // Step 1: Load existing values from DB FIRST (so they take priority)
++  try {
++    const db = getDb();
++    const rows = await db.select().from(settings);
++    console.log(`[Settings] Loaded ${rows.length} settings from DB`);
++    for (const row of rows) {
++      if (row.value !== null && row.value !== undefined) {
++        memoryStore.set(row.key, row.value);
++      }
++    }
++  } catch (e: any) {
++    console.warn("[Settings] DB load failed:", e.message);
++  }
++
++  // Step 2: Set defaults only for keys NOT already in DB/memory
+   for (const s of DEFAULT_SETTINGS) {
+-    memoryStore.set(s.key, s.value ?? "");
++    if (!memoryStore.has(s.key)) {
++      memoryStore.set(s.key, s.value ?? "");
++    }
+   }
+ 
++  // Step 3: Insert defaults into DB (won't overwrite existing due to onDuplicateKeyUpdate)
+   try {
+     const db = getDb();
+     for (const s of DEFAULT_SETTINGS) {
+       await db.insert(settings).values(s).onDuplicateKeyUpdate({
+-        set: { updatedAt: new Date() },
++        set: { updatedAt: new Date() },  // Only touch updatedAt, preserve existing value
+       });
+     }
+   } catch (e: any) {
+-    console.warn("DB settings init failed, using memory:", e.message);
++    console.warn("DB settings init failed:", e.message);
+   }
+ }
+ 
+@@ -53,20 +71,21 @@ export async function initializeDefaultSettings(): Promise<void> {
+ export async function getSettingValue(key: string): Promise<string | null> {
+   // Check memory first
+   const mem = memoryStore.get(key);
+-  if (mem !== undefined) return mem;
++  if (mem !== undefined) {
++    return mem;
++  }
+ 
+   // Try DB
+   try {
+     const db = getDb();
+-    const row = await db.query.settings.findFirst({
+-      where: eq(settings.key, key),
+-    });
++    const rows = await db.select().from(settings).where(eq(settings.key, key)).limit(1);
++    const row = rows[0];
+     if (row?.value !== null && row?.value !== undefined) {
+       memoryStore.set(key, row.value);
+       return row.value;
+     }
+-  } catch {
+-    // DB failed, use default from memory
++  } catch (e: any) {
++    console.warn(`[Settings] DB read failed for ${key}:`, e.message);
+   }
+ 
+   return memoryStore.get(key) ?? null;
+@@ -80,12 +99,11 @@ export async function setSettingValue(key: string, value: string): Promise<void>
+   // Try DB
+   try {
+     const db = getDb();
+-    const existing = await db.query.settings.findFirst({
+-      where: eq(settings.key, key),
+-    });
++    const existing = await db.select().from(settings).where(eq(settings.key, key)).limit(1);
+ 
+-    if (existing) {
++    if (existing.length > 0) {
+       await db.update(settings).set({ value, updatedAt: new Date() }).where(eq(settings.key, key));
++      console.log(`[Settings] Updated ${key} in DB`);
+     } else {
+       const def = DEFAULT_SETTINGS.find((s) => s.key === key);
+       await db.insert(settings).values({
+@@ -93,9 +111,10 @@ export async function setSettingValue(key: string, value: string): Promise<void>
+         value,
+         description: def?.description ?? "",
+       });
++      console.log(`[Settings] Inserted ${key} into DB`);
+     }
+   } catch (e: any) {
+-    console.warn(`DB save failed for ${key}, saved to memory:`, e.message);
++    console.error(`[Settings] DB save failed for ${key}:`, e.message);
+   }
+ }
+ 
+diff --git a/api/router.ts b/api/router.ts
+index cf9a616..6bd2b96 100644
+--- a/api/router.ts
++++ b/api/router.ts
+@@ -4,14 +4,8 @@ import { postRouter } from "./postRouter";
+ import { settingsRouter } from "./settingsRouter";
+ import { agentRouter } from "./agentRouter";
+ import { templateRouter } from "./templateRouter";
+-import { initializeDefaultSettings } from "./queries/settings";
+ import { createRouter, publicQuery } from "./middleware";
+ 
+-// Initialize default settings on first load
+-initializeDefaultSettings().catch((err) => {
+-  console.warn("Settings init warning:", err.message);
+-});
+-
+ export const appRouter = createRouter({
+   ping: publicQuery.query(() => ({ ok: true, ts: Date.now() })),
+   auth: authRouter,
+diff --git a/api/services/agent.ts b/api/services/agent.ts
+index afc6d48..e24ddd6 100644
+--- a/api/services/agent.ts
++++ b/api/services/agent.ts
+@@ -30,6 +30,7 @@ export function isAgentRunning(): boolean {
+ 
+ export async function startAgent(): Promise<{ success: boolean; message: string }> {
+   const enabled = await getSettingValue("agentEnabled");
++  console.log(`[Agent] startAgent called, agentEnabled=${enabled}`);
+   if (enabled !== "true") {
+     return { success: false, message: "Agent is disabled. Enable it in Settings first." };
+   }
+@@ -72,14 +73,17 @@ export async function stopAgent(): Promise<{ success: boolean; message: string }
+ 
+ export async function runOnce(): Promise<{ success: boolean; message: string }> {
+   const enabled = await getSettingValue("agentEnabled");
++  console.log(`[Agent] runOnce called, agentEnabled=${enabled}`);
+   if (enabled !== "true") {
+     return { success: false, message: "Agent is disabled. Enable it in Settings first." };
+   }
+   const agentRun = await createAgentRun({ triggeredBy: "manual" });
++  console.log(`[Agent] Created agent run #${agentRun.id}, executing cycle...`);
+   return executeAgentCycle(agentRun.id);
+ }
+ 
+ async function executeAgentCycle(runId: number): Promise<{ success: boolean; message: string }> {
++  console.log(`[Agent] Executing cycle for run #${runId}`);
+   let productsFound = 0;
+   let productsPosted = 0;
+   let errorsCount = 0;

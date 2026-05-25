@@ -31,85 +31,172 @@ const DEFAULTS: InsertSetting[] = [
 export async function initializeDefaultSettings(): Promise<void> {
   if (initDone) return;
   initDone = true;
-  for (const s of DEFAULTS) memoryStore.set(s.key, s.value ?? "");
+
+  // Step 1: Load existing values from DB FIRST (so they take priority over defaults)
+  try {
+    const db = getDb();
+    const rows = await db.select().from(settings);
+    console.log(`[Settings] Loaded ${rows.length} settings from DB`);
+    for (const row of rows) {
+      if (row.value !== null && row.value !== undefined) {
+        memoryStore.set(row.key, row.value);
+      }
+    }
+  } catch (e: any) {
+    console.warn("[Settings] DB load failed:", e.message);
+  }
+
+  // Step 2: Set defaults only for keys NOT already in DB/memory
+  for (const s of DEFAULTS) {
+    if (!memoryStore.has(s.key)) {
+      memoryStore.set(s.key, s.value ?? "");
+    }
+  }
+
+  // Step 3: Insert defaults into DB (onDuplicateKeyUpdate won't overwrite existing values)
   try {
     const db = getDb();
     for (const s of DEFAULTS) {
-      await db.insert(settings).values(s).onDuplicateKeyUpdate({ set: { updatedAt: new Date() } });
+      await db.insert(settings).values(s).onDuplicateKeyUpdate({
+        set: { updatedAt: new Date() },
+      });
     }
   } catch (e: any) {
-    console.warn("DB init failed, using memory:", e.message);
+    console.warn("[Settings] DB init failed:", e.message);
   }
 }
 
 export async function getSettingValue(key: string): Promise<string | null> {
+  // Check memory first
   const mem = memoryStore.get(key);
-  if (mem !== undefined) return mem;
+  if (mem !== undefined) {
+    return mem;
+  }
+
+  // Try DB
   try {
     const db = getDb();
-    const row = await db.query.settings.findFirst({ where: eq(settings.key, key) });
-    if (row?.value != null) { memoryStore.set(key, row.value); return row.value; }
-  } catch {}
+    const rows = await db.select().from(settings).where(eq(settings.key, key)).limit(1);
+    const row = rows[0];
+    if (row?.value !== null && row?.value !== undefined) {
+      memoryStore.set(key, row.value);
+      return row.value;
+    }
+  } catch (e: any) {
+    console.warn(`[Settings] DB read failed for ${key}:`, e.message);
+  }
+
   return memoryStore.get(key) ?? null;
 }
 
 export async function setSettingValue(key: string, value: string): Promise<void> {
+  // Always update memory
   memoryStore.set(key, value);
+
+  // Try DB
   try {
     const db = getDb();
-    const existing = await db.query.settings.findFirst({ where: eq(settings.key, key) });
-    if (existing) {
+    const existing = await db.select().from(settings).where(eq(settings.key, key)).limit(1);
+
+    if (existing.length > 0) {
       await db.update(settings).set({ value, updatedAt: new Date() }).where(eq(settings.key, key));
+      console.log(`[Settings] Updated ${key} in DB`);
     } else {
-      await db.insert(settings).values({ key, value });
+      const def = DEFAULTS.find((s) => s.key === key);
+      await db.insert(settings).values({
+        key,
+        value,
+        description: def?.description ?? "",
+      });
+      console.log(`[Settings] Inserted ${key} into DB`);
     }
   } catch (e: any) {
-    console.warn(`DB save failed for ${key}:`, e.message);
+    console.error(`[Settings] DB save failed for ${key}:`, e.message);
   }
-}
-
-export async function getSettingJson<T>(key: string): Promise<T | null> {
-  const v = await getSettingValue(key);
-  if (!v) return null;
-  try { return JSON.parse(v) as T; } catch { return null; }
 }
 
 export async function findAllSettings(): Promise<Setting[]> {
   await initializeDefaultSettings();
+
   try {
     const db = getDb();
     const rows = await db.select().from(settings);
-    for (const r of rows) memoryStore.set(r.key, r.value ?? "");
-  } catch {}
-  return DEFAULTS.map((s, i) => ({
-    id: i, key: s.key, value: memoryStore.get(s.key) ?? s.value ?? "",
-    description: s.description ?? null, isEncrypted: false, updatedAt: new Date(),
-  } as Setting));
+    // Sync to memory
+    for (const row of rows) {
+      memoryStore.set(row.key, row.value ?? "");
+    }
+    // Return merged (defaults + DB)
+    const result: Setting[] = [];
+    for (const s of DEFAULTS) {
+      const dbRow = rows.find((r) => r.key === s.key);
+      result.push({
+        id: dbRow?.id ?? 0,
+        key: s.key,
+        value: memoryStore.get(s.key) ?? s.value,
+        description: s.description ?? null,
+        isEncrypted: false,
+        updatedAt: dbRow?.updatedAt ?? new Date(),
+      } as Setting);
+    }
+    return result;
+  } catch {
+    // Return from memory
+    return DEFAULTS.map((s, i) => ({
+      id: i,
+      key: s.key,
+      value: memoryStore.get(s.key) ?? s.value ?? "",
+      description: s.description ?? null,
+      isEncrypted: false,
+      updatedAt: new Date(),
+    } as Setting));
+  }
+}
+
+export async function getSettingJson<T = unknown>(key: string): Promise<T | null> {
+  const value = await getSettingValue(key);
+  if (!value) return null;
+  try {
+    return JSON.parse(value) as T;
+  } catch {
+    return null;
+  }
 }
 
 export async function findSettingByKey(key: string): Promise<Setting | undefined> {
   const all = await findAllSettings();
-  return all.find(s => s.key === key);
+  return all.find((s) => s.key === key);
 }
 
-export async function upsertSetting(key: string, value: string, _desc?: string): Promise<void> {
+export async function upsertSetting(key: string, value: string, _description?: string): Promise<void> {
   await setSettingValue(key, value);
 }
 
 export async function getConnectionStatus() {
+  const r = {
+    pinterest: { connected: false, hasToken: false, hasBoard: false },
+    linkedin: { connected: false, hasToken: false, hasUser: false },
+    telegram: { connected: false, hasToken: false, hasChannel: false },
+    referral: { configured: false, url: "" as string | null },
+    amazonReferral: { configured: false, url: "" as string | null },
+  };
+
   const pt = await getSettingValue("pinterestAccessToken");
   const pb = await getSettingValue("pinterestBoardId");
+  r.pinterest = { connected: !!(pt && pb), hasToken: !!pt, hasBoard: !!pb };
+
   const lt = await getSettingValue("linkedinAccessToken");
   const lu = await getSettingValue("linkedinUserId");
+  r.linkedin = { connected: !!(lt && lu), hasToken: !!lt, hasUser: !!lu };
+
   const tt = await getSettingValue("telegramBotToken");
   const tc = await getSettingValue("telegramChannelId");
+  r.telegram = { connected: !!(tt && tc), hasToken: !!tt, hasChannel: !!tc };
+
   const ref = await getSettingValue("referralBaseUrl");
+  r.referral = { configured: !!ref, url: ref };
+
   const aref = await getSettingValue("amazonReferralUrl");
-  return {
-    pinterest: { connected: !!(pt && pb), hasToken: !!pt, hasBoard: !!pb },
-    linkedin: { connected: !!(lt && lu), hasToken: !!lt, hasUser: !!lu },
-    telegram: { connected: !!(tt && tc), hasToken: !!tt, hasChannel: !!tc },
-    referral: { configured: !!ref, url: ref },
-    amazonReferral: { configured: !!aref, url: aref },
-  };
+  r.amazonReferral = { configured: !!aref, url: aref };
+
+  return r;
 }
